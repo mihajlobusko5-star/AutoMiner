@@ -1,6 +1,6 @@
 script_name("AutoMiner")
 script_author("Moli")
-script_version("1.0.1")
+script_version("1.1.0")
 
 require "lib.moonloader"
 
@@ -1277,7 +1277,7 @@ local function getScriptDir()
 end
 
 
-local Runtime={revision="1.0.1",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
+local Runtime={revision="1.1.0",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
 function Runtime.failure(message)
     UI.storageError="Не вдалося зберегти дані: "..tostring(message)
 end
@@ -1568,6 +1568,156 @@ local function ensureAutoMinerDirectory(path)
     return false
 end
 local function cacheFilePath(name) return cacheDirPath().."\\"..tostring(name or "") end
+
+
+local UPDATE_MANIFEST_URL="https://raw.githubusercontent.com/mihajlobusko5-star/AutoMiner/main/version.json"
+local UpdateManager={
+    status="idle",latest=nil,downloadUrl=nil,sha256=nil,changelog={},expanded=false,
+    error=nil,lastCheck=0,nextCheck=0,installed=false,installedVersion=nil,checking=false,installing=false
+}
+
+local function updateQps(value) return tostring(value or ""):gsub("'","''") end
+local function updateReadAll(path)
+    local f=io.open(path,"rb");if not f then return nil end
+    local body=f:read("*a");f:close();return body
+end
+local function updateWriteAll(path,body)
+    local f=io.open(path,"wb");if not f then return false end
+    local ok=f:write(body or "");f:close();return ok~=nil
+end
+local function updateJsonUnescape(value)
+    value=tostring(value or "")
+    value=value:gsub('\\"','"'):gsub('\\\\','\\'):gsub('\\/','/')
+    value=value:gsub('\\n','\n'):gsub('\\r','\r'):gsub('\\t','\t')
+    return value
+end
+local function updateParseManifest(body)
+    body=tostring(body or "")
+    local version=body:match('"version"%s*:%s*"([^"]+)"')
+    local url=body:match('"download_url"%s*:%s*"([^"]+)"')
+    local sha=body:match('"sha256"%s*:%s*"([0-9a-fA-F]+)"')
+    local block=body:match('"changelog"%s*:%s*%[(.-)%]') or ""
+    local changes={}
+    for item in block:gmatch('"(([^"\\]|\\.)*)"') do changes[#changes+1]=updateJsonUnescape(item) end
+    if not version or version=="" or not url or url=="" then return nil,"manifest fields missing" end
+    if sha and #sha~=64 then return nil,"invalid sha256" end
+    return {version=version,download_url=updateJsonUnescape(url),sha256=sha and sha:lower() or nil,changelog=changes}
+end
+local function updateVersionParts(v)
+    local a,b,c=tostring(v or "0"):match("^(%d+)%.(%d+)%.(%d+)")
+    return tonumber(a) or 0,tonumber(b) or 0,tonumber(c) or 0
+end
+local function updateVersionNewer(remote,localv)
+    local ra,rb,rc=updateVersionParts(remote);local la,lb,lc=updateVersionParts(localv)
+    if ra~=la then return ra>la end;if rb~=lb then return rb>lb end;return rc>lc
+end
+local function updateDownload(url,path,timeout)
+    if not downloadUrlToFile then return false,"downloadUrlToFile unavailable" end
+    pcall(os.remove,path)
+    local done,success=false,false
+    local ok,err=pcall(downloadUrlToFile,url,path,function(_,status)
+        if status==6 then done=true;success=true elseif status==7 then done=true;success=false end
+    end)
+    if not ok then return false,tostring(err or "download start failed") end
+    local started=getGameTimer();timeout=timeout or 60000
+    while not done and getGameTimer()-started<timeout do wait(50) end
+    if not done then pcall(os.remove,path);return false,"download timeout" end
+    if not success then pcall(os.remove,path);return false,"download failed" end
+    return true
+end
+local function updateSha256(path)
+    local cmd="powershell -NoProfile -ExecutionPolicy Bypass -Command \"$h=(Get-FileHash -LiteralPath '"..updateQps(path).."' -Algorithm SHA256).Hash;[Console]::Out.Write($h.ToLower())\""
+    local h=io.popen(cmd,"r");if not h then return nil end
+    local out=h:read("*a") or "";h:close();out=out:gsub("%s+",""):lower()
+    return (#out==64 and out:match("^[0-9a-f]+$")) and out or nil
+end
+function UpdateManager.check(manual)
+    if UpdateManager.checking or UpdateManager.installing then return false end
+    UpdateManager.checking=true;UpdateManager.error=nil;UpdateManager.status="checking"
+    lua_thread.create(function()
+        ensureAutoMinerDirectory(cacheDirPath())
+        local path=cacheFilePath("update-manifest.download.tmp")
+        local url=UPDATE_MANIFEST_URL.."?t="..tostring(os.time())
+        local ok,why=updateDownload(url,path,25000)
+        if not ok then
+            UpdateManager.error=tostring(why);UpdateManager.status="error";UpdateManager.checking=false
+            Runtime.log("UPDATE_CHECK_ERROR",UpdateManager.error,10)
+            if manual then UI.notice=Settings.language=="ru" and "Не удалось проверить обновления" or "Не вдалося перевірити оновлення" end
+            return
+        end
+        local manifest,err=updateParseManifest(updateReadAll(path));pcall(os.remove,path)
+        if not manifest then
+            UpdateManager.error=tostring(err);UpdateManager.status="error";UpdateManager.checking=false
+            Runtime.log("UPDATE_MANIFEST_ERROR",UpdateManager.error,10)
+            if manual then UI.notice=Settings.language=="ru" and "Некорректный файл обновления" or "Некоректний файл оновлення" end
+            return
+        end
+        UpdateManager.latest=manifest.version;UpdateManager.downloadUrl=manifest.download_url
+        UpdateManager.sha256=manifest.sha256;UpdateManager.changelog=manifest.changelog or {}
+        UpdateManager.lastCheck=os.time();UpdateManager.nextCheck=os.time()+6*60*60
+        UpdateManager.status=updateVersionNewer(manifest.version,Runtime.revision) and "available" or "latest"
+        UpdateManager.checking=false
+        Runtime.log("UPDATE_CHECK","local="..tostring(Runtime.revision).." remote="..tostring(manifest.version).." status="..UpdateManager.status)
+        if manual then
+            UI.notice=UpdateManager.status=="available"
+                and (Settings.language=="ru" and ("Доступно обновление v"..manifest.version) or ("Доступне оновлення v"..manifest.version))
+                or (Settings.language=="ru" and "Установлена последняя версия" or "Встановлена остання версія")
+        end
+    end)
+    return true
+end
+function UpdateManager.install()
+    if UpdateManager.installing or UpdateManager.checking or UpdateManager.status~="available" then return false end
+    if not UpdateManager.downloadUrl or not UpdateManager.sha256 then
+        UpdateManager.error=Settings.language=="ru" and "В manifest отсутствует SHA-256" or "У manifest відсутній SHA-256"
+        UpdateManager.status="error";return false
+    end
+    UpdateManager.installing=true;UpdateManager.error=nil;UpdateManager.status="downloading"
+    lua_thread.create(function()
+        ensureAutoMinerDirectory(cacheDirPath())
+        local tmp=cacheFilePath("AutoMiner.update.tmp")
+        local backup=cacheFilePath("AutoMiner.backup.lua")
+        local sep=UpdateManager.downloadUrl:find("?",1,true) and "&" or "?"
+        local ok,why=updateDownload(UpdateManager.downloadUrl..sep.."t="..tostring(os.time()),tmp,90000)
+        if not ok then
+            UpdateManager.error=tostring(why);UpdateManager.status="error";UpdateManager.installing=false
+            Runtime.log("UPDATE_DOWNLOAD_ERROR",UpdateManager.error);return
+        end
+        local body=updateReadAll(tmp)
+        if not body or #body<10000 or not body:find('script_name("AutoMiner")',1,true) then
+            pcall(os.remove,tmp);UpdateManager.error="invalid AutoMiner.lua";UpdateManager.status="error";UpdateManager.installing=false
+            Runtime.log("UPDATE_VALIDATE_ERROR",UpdateManager.error);return
+        end
+        UpdateManager.status="verifying"
+        local digest=updateSha256(tmp)
+        if not digest or digest~=tostring(UpdateManager.sha256):lower() then
+            pcall(os.remove,tmp);UpdateManager.error="SHA-256 mismatch";UpdateManager.status="error";UpdateManager.installing=false
+            Runtime.log("UPDATE_HASH_ERROR","expected="..tostring(UpdateManager.sha256).." actual="..tostring(digest));return
+        end
+        UpdateManager.status="installing"
+        local script=thisScript();local target=script and script.path or (getScriptDir().."\\AutoMiner.lua")
+        pcall(os.remove,backup)
+        local cmd="powershell -NoProfile -ExecutionPolicy Bypass -Command \"$src='"..updateQps(tmp).."';$dst='"..updateQps(target).."';$bak='"..updateQps(backup).."';if(Test-Path -LiteralPath $bak){Remove-Item -LiteralPath $bak -Force};[System.IO.File]::Replace($src,$dst,$bak,$true)\""
+        local code=os.execute(cmd)
+        local replaced=(code==0 or code==true) and doesFileExist and doesFileExist(target)
+        if not replaced then
+            local current=updateReadAll(target)
+            if current then updateWriteAll(backup,current) end
+            local fresh=updateReadAll(tmp)
+            replaced=fresh and updateWriteAll(target,fresh) or false
+            if replaced then pcall(os.remove,tmp) end
+        end
+        if not replaced then
+            UpdateManager.error="replace failed";UpdateManager.status="error";UpdateManager.installing=false
+            Runtime.log("UPDATE_INSTALL_ERROR",UpdateManager.error);return
+        end
+        UpdateManager.installed=true;UpdateManager.installedVersion=UpdateManager.latest
+        UpdateManager.status="installed";UpdateManager.installing=false
+        Runtime.log("UPDATE_INSTALLED","version="..tostring(UpdateManager.installedVersion).." backup="..tostring(backup))
+        UI.notice=Settings.language=="ru" and "Обновление установлено. Перезапустите скрипт или игру." or "Оновлення встановлено. Перезапустіть скрипт або гру."
+    end)
+    return true
+end
 local function migrateFileIfNeeded(oldPath,newPath)
     if doesFileExist and doesFileExist(oldPath) and not doesFileExist(newPath) then
         local ok=pcall(os.rename,oldPath,newPath)
@@ -9109,7 +9259,7 @@ local SettingsSearchKeywords={
     notifyRefillErrors="автозаправка помилка refill error повідомлення",notifyMaintenance="обслуговування обслуживание maintenance повідомлення",
     notifyElectricity="електрика electricity поповнення повідомлення",notifyTaxes="податки налоги taxes повідомлення",
     notifyCritical="критичні помилки critical errors повідомлення",notifyBackground="фонові перевірки background scan повідомлення",
-    ignoredHouse="ігнорувати будинок дом ignore"
+    ignoredHouse="ігнорувати будинок дом ignore",updates="оновлення обновление update version версия changelog список изменений скачать install github"
 }
 function View.drawSettingsPage(x,y,w,h)
     local origin=y
@@ -9145,6 +9295,46 @@ function View.drawSettingsPage(x,y,w,h)
         if imgui.IsItemClicked() then ffi.fill(UI.settingsSearch,128,0);searchRaw="" end
     end
     y=y+50
+
+    if UpdateManager.status=="available" or UpdateManager.status=="downloading" or UpdateManager.status=="verifying" or UpdateManager.status=="installing" or UpdateManager.status=="installed" or UpdateManager.status=="error" then
+        local ru=Settings.language=="ru";local cardY=y;local available=UpdateManager.status=="available"
+        local expanded=UpdateManager.expanded or UpdateManager.status~="available"
+        local cardH=available and (expanded and (140+math.max(1,#(UpdateManager.changelog or {}))*25) or 58) or 76
+        local accent=available and P.green or (UpdateManager.status=="error" and P.red or P.cyan)
+        View.drawSmoothRoundedRect(x,cardY,w,cardH,16,u32(View.panelFill(true,true),1),u32(accent,available and .62 or .34),1.4,16)
+        if available then
+            View.drawSmoothRoundedRect(x+10,cardY+10,6,38,3,u32(P.green,.95),nil,0,6)
+            local title=ru and ("ДОСТУПНО ОБНОВЛЕНИЕ  v"..tostring(UpdateManager.latest or "")) or ("ДОСТУПНЕ ОНОВЛЕННЯ  v"..tostring(UpdateManager.latest or ""))
+            View.drawText(x+28,cardY+15,title,Fonts.semibold,P.green)
+            View.drawText(x+28,cardY+35,ru and "Нажмите, чтобы посмотреть изменения" or "Натисніть, щоб переглянути зміни",Fonts.small,P.muted)
+            imgui.SetCursorScreenPos(imgui.ImVec2(x,cardY));imgui.InvisibleButton("##update_available_banner",imgui.ImVec2(w,58))
+            if imgui.IsItemClicked() then UpdateManager.expanded=not UpdateManager.expanded end
+            local cx=x+w-25;local cy=cardY+29;local dl2=imgui.GetWindowDrawList()
+            if UpdateManager.expanded then
+                dl2:AddLine(imgui.ImVec2(cx-5,cy+2),imgui.ImVec2(cx,cy-3),u32(P.green,.9),1.7);dl2:AddLine(imgui.ImVec2(cx,cy-3),imgui.ImVec2(cx+5,cy+2),u32(P.green,.9),1.7)
+            else
+                dl2:AddLine(imgui.ImVec2(cx-5,cy-2),imgui.ImVec2(cx,cy+3),u32(P.green,.9),1.7);dl2:AddLine(imgui.ImVec2(cx,cy+3),imgui.ImVec2(cx+5,cy-2),u32(P.green,.9),1.7)
+            end
+            if UpdateManager.expanded then
+                local yy=cardY+68
+                View.drawText(x+28,yy,ru and "Что нового" or "Що нового",Fonts.small,P.text);yy=yy+24
+                local changes=UpdateManager.changelog or {}
+                if #changes==0 then changes={ru and "Исправления и улучшения" or "Виправлення та покращення"} end
+                for i,item in ipairs(changes) do
+                    imgui.GetWindowDrawList():AddCircleFilled(imgui.ImVec2(x+33,yy+7),3,u32(P.cyan,.9),16)
+                    View.drawText(x+46,yy,tostring(item),Fonts.small,P.muted);yy=yy+25
+                end
+                if View.shellButton("##install_update",ru and ("Обновить до v"..tostring(UpdateManager.latest)) or ("Оновити до v"..tostring(UpdateManager.latest)),x+28,yy+3,w-56,34,true) then UpdateManager.install() end
+            end
+        else
+            local title,status
+            if UpdateManager.status=="installed" then title=ru and "ОБНОВЛЕНИЕ УСТАНОВЛЕНО" or "ОНОВЛЕННЯ ВСТАНОВЛЕНО";status=ru and "Перезапустите скрипт или игру" or "Перезапустіть скрипт або гру"
+            elseif UpdateManager.status=="error" then title=ru and "ОБНОВЛЕНИЕ: ОШИБКА" or "ОНОВЛЕННЯ: ПОМИЛКА";status=tostring(UpdateManager.error or "")
+            else title=ru and "ОБНОВЛЕНИЕ" or "ОНОВЛЕННЯ";status=ru and "Загрузка и проверка файла..." or "Завантаження та перевірка файлу..." end
+            View.drawText(x+20,cardY+16,title,Fonts.semibold,accent);View.drawText(x+20,cardY+40,status,Fonts.small,P.muted)
+        end
+        y=y+cardH+12
+    end
 
     local function normalizeSearch(value)
         local s=lowerServerText(tostring(value or ""))
@@ -9217,6 +9407,17 @@ function View.drawSettingsPage(x,y,w,h)
     end
 
     local function renderGeneral()
+        group("Оновлення")
+        row("updates",Settings.language=="ru" and "Версия AutoMiner" or "Версія AutoMiner",(Settings.language=="ru" and "Текущая: v" or "Поточна: v")..tostring(Runtime.revision),function(cx,cy,cw)
+            local ru=Settings.language=="ru";local label
+            if UpdateManager.checking then label=ru and "Проверяем..." or "Перевіряємо..."
+            elseif UpdateManager.status=="latest" then label=ru and "Последняя версия" or "Остання версія"
+            elseif UpdateManager.status=="available" then label=ru and ("Доступно v"..tostring(UpdateManager.latest)) or ("Доступно v"..tostring(UpdateManager.latest))
+            else label=ru and "Проверить обновления" or "Перевірити оновлення" end
+            if View.shellButton("##check_updates",label,cx,cy,cw,32,UpdateManager.status=="available") then
+                if UpdateManager.status=="available" then UpdateManager.expanded=true else UpdateManager.check(true) end
+            end
+        end,32,Settings.language=="ru" and "AutoMiner проверяет GitHub на наличие новой стабильной версии. Установка выполняется только после вашего нажатия." or "AutoMiner перевіряє GitHub на наявність нової стабільної версії. Встановлення виконується лише після вашого натискання.","updates")
         group("Інтерфейс")
         choice("language","Мова","Мова меню та повідомлень",{{"uk","Українська"},{"ru","Русский"}},function(value)
             I18n.setLanguage(value)
@@ -11818,6 +12019,7 @@ function main()
         UIResources.prewarmRequestedAt=getGameTimer()
         Runtime.log("PERF_PREWARM_REQUEST","runtime_ready_1800ms")
     end)
+    lua_thread.create(function() wait(2500);UpdateManager.check(false) end)
     Journal.add("system","AutoMiner запущено","Нова сесія · /miner")
     local function toggleMiner()
         if UI.open[0] or UI.closing then View.requestMainClose(); return end
@@ -11856,6 +12058,12 @@ function main()
             if not BitcoinPrice.busy and getGameTimer()>=BitcoinPrice.nextAttempt then fetchBitcoinPrice() end
             if not BitcoinHistory.busy and getGameTimer()>=(BitcoinHistory.nextAttempt or 0) then fetchBitcoinHistory() end
             if not BitcoinHourly.busy and getGameTimer()>=(BitcoinHourly.nextAttempt or 0) then fetchBitcoinHourly() end
+        end
+    end)
+    lua_thread.create(function()
+        while true do
+            wait(60000)
+            if not UpdateManager.checking and not UpdateManager.installing and os.time()>=(UpdateManager.nextCheck or 0) then UpdateManager.check(false) end
         end
     end)
     lua_thread.create(function()
