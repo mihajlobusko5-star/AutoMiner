@@ -1,6 +1,6 @@
 script_name("AutoMiner")
 script_author("Moli")
-script_version("1.1.1")
+script_version("1.1.2")
 
 require "lib.moonloader"
 
@@ -1277,7 +1277,7 @@ local function getScriptDir()
 end
 
 
-local Runtime={revision="1.1.1",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
+local Runtime={revision="1.1.2",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
 function Runtime.failure(message)
     UI.storageError="Не вдалося зберегти дані: "..tostring(message)
 end
@@ -1627,18 +1627,38 @@ local function updateVersionNewer(remote,localv)
     local ra,rb,rc=updateVersionParts(remote);local la,lb,lc=updateVersionParts(localv)
     if ra~=la then return ra>la end;if rb~=lb then return rb>lb end;return rc>lc
 end
+UpdateManager.downloadCallbacks=UpdateManager.downloadCallbacks or {}
+UpdateManager.downloadSerial=UpdateManager.downloadSerial or 0
 local function updateDownload(url,path,timeout)
     if not downloadUrlToFile then return false,"downloadUrlToFile unavailable" end
     pcall(os.remove,path)
-    local done,success=false,false
-    local ok,err=pcall(downloadUrlToFile,url,path,function(_,status)
-        if status==6 then done=true;success=true elseif status==7 then done=true;success=false end
-    end)
-    if not ok then return false,tostring(err or "download start failed") end
+    UpdateManager.downloadSerial=UpdateManager.downloadSerial+1
+    local token=UpdateManager.downloadSerial
+    local state={done=false,success=false,timedOut=false}
+    local callback
+    callback=function(_,status)
+        if status==6 then state.done=true;state.success=true
+        elseif status==7 then state.done=true;state.success=false end
+        if state.done then
+            -- Keep the callback alive until MoonLoader confirms completion/failure.
+            -- Releasing it on our own timeout can leave native downloader code with
+            -- a dangling Lua callback and crash lua51.dll later.
+            UpdateManager.downloadCallbacks[token]=nil
+            if state.timedOut then pcall(os.remove,path) end
+        end
+    end
+    UpdateManager.downloadCallbacks[token]=callback
+    local ok,err=pcall(downloadUrlToFile,url,path,callback)
+    if not ok then UpdateManager.downloadCallbacks[token]=nil;return false,tostring(err or "download start failed") end
     local started=getGameTimer();timeout=timeout or 60000
-    while not done and getGameTimer()-started<timeout do wait(50) end
-    if not done then pcall(os.remove,path);return false,"download timeout" end
-    if not success then pcall(os.remove,path);return false,"download failed" end
+    while not state.done and getGameTimer()-started<timeout do wait(50) end
+    if not state.done then
+        state.timedOut=true
+        -- Do not free the callback here. MoonLoader may still invoke it later.
+        -- The callback removes itself only after a terminal download status.
+        return false,"download timeout"
+    end
+    if not state.success then pcall(os.remove,path);return false,"download failed" end
     return true
 end
 local function updateSha256(path)
@@ -12052,7 +12072,7 @@ function main()
         UIResources.prewarmRequestedAt=getGameTimer()
         Runtime.log("PERF_PREWARM_REQUEST","runtime_ready_1800ms")
     end)
-    lua_thread.create(function() wait(2500);UpdateManager.check(false) end)
+    lua_thread.create(function() wait(8000);if not UI.open[0] and not UI.closing then UpdateManager.check(false) else wait(5000);UpdateManager.check(false) end end)
     Journal.add("system","AutoMiner запущено","Нова сесія · /miner")
     local function toggleMiner()
         if UI.open[0] or UI.closing then View.requestMainClose(); return end
