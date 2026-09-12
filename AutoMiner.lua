@@ -1,6 +1,6 @@
 script_name("AutoMiner")
 script_author("Moli")
-script_version("1.1.2")
+script_version("1.1.3")
 
 require "lib.moonloader"
 
@@ -1277,7 +1277,7 @@ local function getScriptDir()
 end
 
 
-local Runtime={revision="1.1.2",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
+local Runtime={revision="1.1.3",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
 function Runtime.failure(message)
     UI.storageError="Не вдалося зберегти дані: "..tostring(message)
 end
@@ -1661,10 +1661,57 @@ local function updateDownload(url,path,timeout)
     if not state.success then pcall(os.remove,path);return false,"download failed" end
     return true
 end
+local UpdateWin32=nil
+local function updateHiddenProcess(command,timeoutMs)
+    if not UpdateWin32 then
+        local ok=pcall(ffi.cdef,[[
+            typedef void* AM_HANDLE;
+            typedef unsigned long AM_DWORD;
+            typedef int AM_BOOL;
+            typedef unsigned short AM_WORD;
+            typedef unsigned char AM_BYTE;
+            typedef struct _AM_STARTUPINFOA {
+                AM_DWORD cb; char* lpReserved; char* lpDesktop; char* lpTitle;
+                AM_DWORD dwX; AM_DWORD dwY; AM_DWORD dwXSize; AM_DWORD dwYSize;
+                AM_DWORD dwXCountChars; AM_DWORD dwYCountChars; AM_DWORD dwFillAttribute;
+                AM_DWORD dwFlags; AM_WORD wShowWindow; AM_WORD cbReserved2; AM_BYTE* lpReserved2;
+                AM_HANDLE hStdInput; AM_HANDLE hStdOutput; AM_HANDLE hStdError;
+            } AM_STARTUPINFOA;
+            typedef struct _AM_PROCESS_INFORMATION {
+                AM_HANDLE hProcess; AM_HANDLE hThread; AM_DWORD dwProcessId; AM_DWORD dwThreadId;
+            } AM_PROCESS_INFORMATION;
+            AM_BOOL CreateProcessA(const char*, char*, void*, void*, AM_BOOL, AM_DWORD, void*, const char*, AM_STARTUPINFOA*, AM_PROCESS_INFORMATION*);
+            AM_DWORD WaitForSingleObject(AM_HANDLE, AM_DWORD);
+            AM_BOOL TerminateProcess(AM_HANDLE, unsigned int);
+            AM_BOOL CloseHandle(AM_HANDLE);
+        ]])
+        local loaded,lib=pcall(ffi.load,"kernel32")
+        if not ok or not loaded then return false,"win32 unavailable" end
+        UpdateWin32=lib
+    end
+    local si=ffi.new("AM_STARTUPINFOA[1]")
+    local pi=ffi.new("AM_PROCESS_INFORMATION[1]")
+    si[0].cb=ffi.sizeof("AM_STARTUPINFOA")
+    si[0].dwFlags=0x00000001 -- STARTF_USESHOWWINDOW
+    si[0].wShowWindow=0      -- SW_HIDE
+    local buffer=ffi.new("char[?]",#command+2)
+    ffi.copy(buffer,command)
+    local ok=UpdateWin32.CreateProcessA(nil,buffer,nil,nil,0,0x08000000,nil,nil,si,pi) -- CREATE_NO_WINDOW
+    if ok==0 then return false,"CreateProcess failed" end
+    local waitResult=UpdateWin32.WaitForSingleObject(pi[0].hProcess,tonumber(timeoutMs) or 15000)
+    if waitResult==0x00000102 then UpdateWin32.TerminateProcess(pi[0].hProcess,1) end
+    UpdateWin32.CloseHandle(pi[0].hThread);UpdateWin32.CloseHandle(pi[0].hProcess)
+    return waitResult==0
+end
 local function updateSha256(path)
-    local cmd="powershell -NoProfile -ExecutionPolicy Bypass -Command \"$h=(Get-FileHash -LiteralPath '"..updateQps(path).."' -Algorithm SHA256).Hash;[Console]::Out.Write($h.ToLower())\""
-    local h=io.popen(cmd,"r");if not h then return nil end
-    local out=h:read("*a") or "";h:close();out=out:gsub("%s+",""):lower()
+    local outPath=cacheFilePath("update-sha256.tmp")
+    pcall(os.remove,outPath)
+    local ps="$h=(Get-FileHash -LiteralPath '"..updateQps(path).."' -Algorithm SHA256).Hash;[System.IO.File]::WriteAllText('"..updateQps(outPath).."',$h.ToLower())"
+    local cmd='powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "'..ps..'"'
+    local ok=updateHiddenProcess(cmd,15000)
+    local out=ok and updateReadAll(outPath) or nil
+    pcall(os.remove,outPath)
+    out=tostring(out or ""):gsub("%s+",""):lower()
     return (#out==64 and out:match("^[0-9a-f]+$")) and out or nil
 end
 function UpdateManager.check(manual)
@@ -1733,16 +1780,15 @@ function UpdateManager.install()
         UpdateManager.status="installing"
         local script=thisScript();local target=script and script.path or (getScriptDir().."\\AutoMiner.lua")
         pcall(os.remove,backup)
-        local cmd="powershell -NoProfile -ExecutionPolicy Bypass -Command \"$src='"..updateQps(tmp).."';$dst='"..updateQps(target).."';$bak='"..updateQps(backup).."';if(Test-Path -LiteralPath $bak){Remove-Item -LiteralPath $bak -Force};[System.IO.File]::Replace($src,$dst,$bak,$true)\""
-        local code=os.execute(cmd)
-        local replaced=(code==0 or code==true) and doesFileExist and doesFileExist(target)
-        if not replaced then
-            local current=updateReadAll(target)
-            if current then updateWriteAll(backup,current) end
-            local fresh=updateReadAll(tmp)
-            replaced=fresh and updateWriteAll(target,fresh) or false
-            if replaced then pcall(os.remove,tmp) end
+        -- Replace with ordinary Lua file I/O so installing an update never opens a console window.
+        local current=updateReadAll(target)
+        local fresh=updateReadAll(tmp)
+        local replaced=false
+        if current and fresh then
+            local backupOk=updateWriteAll(backup,current)
+            replaced=backupOk and updateWriteAll(target,fresh) or false
         end
+        if replaced then pcall(os.remove,tmp) end
         if not replaced then
             UpdateManager.error="replace failed";UpdateManager.status="error";UpdateManager.installing=false
             Runtime.log("UPDATE_INSTALL_ERROR",UpdateManager.error);return
@@ -9196,6 +9242,34 @@ function View.drawAutoCollectStatusChip(x,y,maxW)
     if imgui.IsItemClicked(0) and configured then View.toggleAutoPause() end
 end
 
+function View.drawHeaderUpdateIndicator(x,y,w,h)
+    if UpdateManager.status~="available" then return false end
+    local ru=Settings.language=="ru"
+    local label=ru and ("ОБНОВЛЕНИЕ  v"..tostring(UpdateManager.latest or "")) or ("ОНОВЛЕННЯ  v"..tostring(UpdateManager.latest or ""))
+    imgui.SetCursorScreenPos(imgui.ImVec2(x,y))
+    imgui.InvisibleButton("##header_update_available",imgui.ImVec2(w,h))
+    local hovered=imgui.IsItemHovered()
+    local hoverT=smoothAnim("header_update_hover",hovered and 1 or 0,16)
+    local pulse=Settings.animations=="full" and (.72+.28*math.sin(getGameTimer()/430)) or 1
+    View.drawSmoothRoundedRect(x,y,w,h,h*.5,u32({.028,.050,.040,1},.98),u32(P.green,.45+.30*hoverT),1.35,16)
+    local dl=imgui.GetWindowDrawList()
+    dl:AddCircleFilled(imgui.ImVec2(x+15,y+h*.5),6.2,u32(P.green,.08*hoverT),24)
+    dl:AddCircleFilled(imgui.ImVec2(x+15,y+h*.5),3.3,u32(P.green,.92*pulse),24)
+    local ts=View.calcText(label,Fonts.small)
+    View.drawText(x+28,y+(h-ts.y)*.5,label,Fonts.small,P.green)
+    if hovered then
+        local tip=ru and "Доступна новая версия AutoMiner\nНажмите, чтобы посмотреть изменения" or "Доступна нова версія AutoMiner\nНатисніть, щоб переглянути зміни"
+        drawTooltip("header_update",tip,x,y,w,h)
+    end
+    if imgui.IsItemClicked(0) then
+        UpdateManager.expanded=true
+        UI.settingsSection="general"
+        if UI.activeTab~="settings" then switchTab("settings") end
+        return true
+    end
+    return false
+end
+
 function View.drawHeaderAutoIndicator(x,y,size)
     local configured=Settings.collectMode~="manual"
     local active=configured and Settings.autoPaused~=true
@@ -11663,7 +11737,6 @@ end,function()
         View.drawText(wp.x+28,wp.y+13,"AutoMiner",Fonts.title,P.text)
         local titleW=View.calcText("AutoMiner",Fonts.title).x
         View.drawTextAlpha(wp.x+29,wp.y+38,"by Moli",Fonts.small,P.faint,.42)
-        View.drawSlogan(wp.x+28+titleW+28,wp.y+23,ws.x-330-titleW-28)
 
         local busy=UI.collecting or UI.scanning or UI.waiting
         local headerSize,headerGap=34,8
@@ -11677,6 +11750,12 @@ end,function()
         local capsuleX=refreshX-headerGap-capsuleW
         local capsuleY=headerY
         local autoStatusX=capsuleX-headerGap-headerSize
+        local updateW=146
+        local updateX=autoStatusX-headerGap-updateW
+        if UpdateManager.status=="available" then View.drawHeaderUpdateIndicator(updateX,headerY,updateW,headerSize) end
+        local sloganX=wp.x+28+titleW+28
+        local sloganRight=(UpdateManager.status=="available" and updateX or autoStatusX)-headerGap
+        View.drawSlogan(sloganX,wp.y+23,math.max(80,sloganRight-sloganX))
         View.drawHeaderAutoIndicator(autoStatusX,headerY,headerSize)
         imgui.SetCursorScreenPos(imgui.ImVec2(capsuleX,capsuleY))
         imgui.InvisibleButton("##btc_coefficient",imgui.ImVec2(capsuleW,34))
