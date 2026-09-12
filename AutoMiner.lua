@@ -1,6 +1,6 @@
 script_name("AutoMiner")
 script_author("Moli")
-script_version("1.1.0")
+script_version("1.1.1")
 
 require "lib.moonloader"
 
@@ -1277,7 +1277,7 @@ local function getScriptDir()
 end
 
 
-local Runtime={revision="1.1.0",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
+local Runtime={revision="1.1.1",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
 function Runtime.failure(message)
     UI.storageError="Не вдалося зберегти дані: "..tostring(message)
 end
@@ -1598,7 +1598,23 @@ local function updateParseManifest(body)
     local sha=body:match('"sha256"%s*:%s*"([0-9a-fA-F]+)"')
     local block=body:match('"changelog"%s*:%s*%[(.-)%]') or ""
     local changes={}
-    for item in block:gmatch('"(([^"\\]|\\.)*)"') do changes[#changes+1]=updateJsonUnescape(item) end
+    local pos=1
+    while true do
+        local first=block:find('"',pos,true)
+        if not first then break end
+        local out={};local i=first+1;local escaped=false;local closed=false
+        while i<=#block do
+            local ch=block:sub(i,i)
+            if escaped then out[#out+1]="\\"..ch;escaped=false
+            elseif ch=="\\" then escaped=true
+            elseif ch=='"' then closed=true;break
+            else out[#out+1]=ch end
+            i=i+1
+        end
+        if not closed then break end
+        changes[#changes+1]=updateJsonUnescape(table.concat(out))
+        pos=i+1
+    end
     if not version or version=="" or not url or url=="" then return nil,"manifest fields missing" end
     if sha and #sha~=64 then return nil,"invalid sha256" end
     return {version=version,download_url=updateJsonUnescape(url),sha256=sha and sha:lower() or nil,changelog=changes}
@@ -4345,6 +4361,13 @@ function CollectFlow.problem(message)
     return (CollectFlow.houseNumber and ("Будинок "..CollectFlow.houseNumber.." · ") or "")..gpu..tostring(message or "")
 end
 
+local COLLECT_DELAY={
+    house=90, list=95, gpu=100, confirm=105, back=80, close=80
+}
+local function collectDelay(kind)
+    return COLLECT_DELAY[kind] or 95
+end
+
 function CollectFlow.waitFor(predicate,stage,timeout,timeoutMessage)
     CollectFlow.stage=stage
     DialogGate.stageTo("collect",stage,{house=CollectFlow.houseNumber,rack=CollectFlow.gpuRack,slot=CollectFlow.gpuSlot})
@@ -4378,7 +4401,7 @@ function CollectFlow.answer(id,button,row,input,minDelay,action)
         or ((id==DIALOG_MINER_LIST and button==0) and DIALOG_HOUSE or nil))
     CollectFlow.id=-1
     CollectFlow.expected=nextExpected
-    if not DialogGate.tx("collect",id,button,row or 0,input or "",minDelay or (id==DIALOG_MINER_LIST and 200 or 165),action) then
+    if not DialogGate.tx("collect",id,button,row or 0,input or "",minDelay or (id==DIALOG_MINER_LIST and collectDelay("list") or collectDelay("house")),action) then
         error(CollectFlow.problem("Не вдалося відправити відповідь серверному меню"),0)
     end
 end
@@ -4402,7 +4425,7 @@ function CollectFlow.withdrawAndRead(house)
         end
     end
     if btcRow==nil then error(CollectFlow.problem("Не знайдено дію збору BTC у меню GPU"),0) end
-    CollectFlow.answer(25244,1,btcRow,"",180,"collect_btc")
+    CollectFlow.answer(25244,1,btcRow,"",collectDelay("gpu"),"collect_btc")
     if not CollectFlow.waitFor(function()
         return CollectFlow.confirmation~=nil or CollectFlow.tooLow
     end,"Чекаємо підтвердження виведення",7000,"Не відкрилося підтвердження збору BTC") then
@@ -4417,7 +4440,7 @@ function CollectFlow.withdrawAndRead(house)
         CollectFlow.confirmFingerprint=prompt.fingerprint
         CollectFlow.confirmation=nil
         CollectFlow.stage="Перевіряємо результат виведення"
-        CollectFlow.answer(prompt.id,1,0,"",180,"confirm_btc")
+        CollectFlow.answer(prompt.id,1,0,"",collectDelay("confirm"),"confirm_btc")
     end
     local returned=CollectFlow.waitFor(function()
         return CollectFlow.id==25244 or CollectFlow.id==DIALOG_MINER_LIST
@@ -4429,7 +4452,7 @@ function CollectFlow.withdrawAndRead(house)
             CollectFlow.problem("Повторно перевіряємо залишок BTC. Виведення не повторюємо."))
         CollectFlow.openHouse(house)
     elseif CollectFlow.id==25244 then
-        CollectFlow.answer(25244,0,0,"",165,"back_to_gpu_list")
+        CollectFlow.answer(25244,0,0,"",collectDelay("back"),"back_to_gpu_list")
         CollectFlow.await(DIALOG_MINER_LIST,"Повертаємо список GPU","Не повернувся список GPU після BTC",7500)
     end
 end
@@ -8347,7 +8370,7 @@ function CollectFlow.ensureGpuRunning(gpu)
     end
     if gpu.active==true then return false end
     DialogGate.stageTo("collect","gpu_start_open",{house=CollectFlow.houseNumber,rack=gpu.rack,slot=gpu.slot})
-    CollectFlow.answer(DIALOG_MINER_LIST,1,gpu.row,"",220,"open_gpu_for_start")
+    CollectFlow.answer(DIALOG_MINER_LIST,1,gpu.row,"",collectDelay("list"),"open_gpu_for_start")
     CollectFlow.await(25244,"Відкриваємо меню GPU для запуску","Не відкрилося меню GPU",7500)
 
     local actionRow=nil
@@ -8365,17 +8388,17 @@ function CollectFlow.ensureGpuRunning(gpu)
         row=row+1
     end
     if actionRow==nil then
-        CollectFlow.answer(25244,0,0,"",165,"back_missing_start")
+        CollectFlow.answer(25244,0,0,"",collectDelay("back"),"back_missing_start")
         CollectFlow.await(DIALOG_MINER_LIST,"Повертаємо список GPU","Не повернувся список GPU",7000)
         error(CollectFlow.problem("Не знайдено дію запуску GPU"),0)
     end
     if actionLabel:find("останов",1,true) or actionLabel:find("зупин",1,true) then
-        CollectFlow.answer(25244,0,0,"",165,"already_running")
+        CollectFlow.answer(25244,0,0,"",collectDelay("back"),"already_running")
         CollectFlow.await(DIALOG_MINER_LIST,"Перевіряємо стан GPU","Не повернувся список GPU",7000)
         return false
     end
     DialogGate.stageTo("collect","gpu_start",{house=CollectFlow.houseNumber,rack=gpu.rack,slot=gpu.slot})
-    CollectFlow.answer(25244,1,actionRow,"",180,"start_gpu")
+    CollectFlow.answer(25244,1,actionRow,"",collectDelay("gpu"),"start_gpu")
     CollectFlow.await(DIALOG_MINER_LIST,"Запускаємо GPU після збору","Не повернулося меню після запуску GPU",8000)
     local refreshed=nil
     for _,item in ipairs(CollectFlow.rows(CollectFlow.text,CollectFlow.style)) do
@@ -8386,13 +8409,19 @@ function CollectFlow.ensureGpuRunning(gpu)
     end
     return true
 end
-function CollectFlow.openHouse(house)
-    CollectFlow.houseNumber=house.number;CollectFlow.gpuSlot=nil;CollectFlow.gpuRack=nil
-    CollectFlow.id=-1;CollectFlow.failure=nil
-    CollectFlow.expected=DIALOG_HOUSE
-    DialogGate.stageTo("collect","house_open",{house=house.number})
+function CollectFlow.ensureHouseSelector(house)
+    CollectFlow.houseNumber=house and house.number or CollectFlow.houseNumber
+    CollectFlow.gpuSlot=nil;CollectFlow.gpuRack=nil;CollectFlow.failure=nil
+    if CollectFlow.id==DIALOG_HOUSE then return true end
+    CollectFlow.id=-1;CollectFlow.expected=DIALOG_HOUSE
+    DialogGate.stageTo("collect","house_open",{house=CollectFlow.houseNumber})
     sampSendChat("/flashminer")
     CollectFlow.await(DIALOG_HOUSE,"Чекаємо вибір будинку","Не відкрився вибір будинку",8000)
+    return true
+end
+function CollectFlow.openHouse(house)
+    CollectFlow.houseNumber=house.number;CollectFlow.gpuSlot=nil;CollectFlow.gpuRack=nil
+    CollectFlow.ensureHouseSelector(house)
     local row=nil
     for _,fresh in ipairs(parseHouses(CollectFlow.text)) do
         if fresh.number==house.number then
@@ -8402,13 +8431,15 @@ function CollectFlow.openHouse(house)
         end
     end
     if row==nil then error("Будинок відсутній у списку сервера",0) end
-    CollectFlow.answer(DIALOG_HOUSE,1,row,"",180,"select_house")
+    CollectFlow.answer(DIALOG_HOUSE,1,row,"",collectDelay("house"),"select_house")
     CollectFlow.await(DIALOG_MINER_LIST,"Чекаємо список GPU","Не відкрився список GPU",8000)
 end
-function CollectFlow.closeHouse()
-    CollectFlow.answer(DIALOG_MINER_LIST,0,0,"",170,"close_gpu_list")
+function CollectFlow.closeHouse(keepSelector)
+    CollectFlow.answer(DIALOG_MINER_LIST,0,0,"",collectDelay("close"),"close_gpu_list")
     CollectFlow.await(DIALOG_HOUSE,"Повертаємо вибір будинку","Не повернувся вибір будинку",7000)
-    CollectFlow.answer(DIALOG_HOUSE,0,0,"",150,"close_house_selector")
+    if not keepSelector then
+        CollectFlow.answer(DIALOG_HOUSE,0,0,"",collectDelay("close"),"close_house_selector")
+    end
 end
 function CollectFlow.refreshHouse(house)
     local stats=parseMinerStats(CollectFlow.text)
@@ -8421,6 +8452,7 @@ function CollectFlow.refreshHouse(house)
 end
 function CollectFlow.run(token)
     local s=UI.collect
+    local cycleStarted=getGameTimer()
     local queue={}
     s.stage="Перевіряємо баланс…"
     for _,house in ipairs(UI.houses) do
@@ -8432,6 +8464,7 @@ function CollectFlow.run(token)
     s.totalFarms=#queue
 
     for index,entry in ipairs(queue) do
+        local houseStarted=getGameTimer()
         s.stage="Перевірка ферми "..index.." / "..#queue
         CollectFlow.openHouse(entry.house)
         entry.rows=CollectFlow.rows(CollectFlow.text,CollectFlow.style)
@@ -8457,7 +8490,7 @@ function CollectFlow.run(token)
 
             local wasPaused=(gpu.active==false)
             if not gpu.btc or gpu.btc>=1 then
-                CollectFlow.answer(DIALOG_MINER_LIST,1,gpu.row,"",220,"open_gpu")
+                CollectFlow.answer(DIALOG_MINER_LIST,1,gpu.row,"",collectDelay("list"),"open_gpu")
                 CollectFlow.await(25244,"Відкриваємо меню GPU","Не відкрилося меню GPU",7500)
                 CollectFlow.withdrawAndRead(entry.house)
 
@@ -8485,7 +8518,6 @@ function CollectFlow.run(token)
                 CollectFlow.withdrawing=false
                 CollectFlow.refreshHouse(entry.house)
                 s.report(token,s.received,index-1,s.totalBtc~=nil)
-                wait(120)
             end
 
             if wasPaused then
@@ -8497,11 +8529,12 @@ function CollectFlow.run(token)
 
         CollectFlow.refreshHouse(entry.house)
         s.report(token,s.received,index,s.totalBtc~=nil)
-        CollectFlow.closeHouse()
+        CollectFlow.closeHouse(index<#queue)
         CollectFlow.gpuRack=nil;CollectFlow.gpuSlot=nil
-        wait(220)
+        Runtime.log("COLLECT_HOUSE_TIMING","house="..tostring(entry.house.number).." ms="..tostring(getGameTimer()-houseStarted).." gpus="..tostring(#entry.rows))
     end
 
+    Runtime.log("COLLECT_CYCLE_TIMING","ms="..tostring(getGameTimer()-cycleStarted).." houses="..tostring(#queue).." btc="..tostring(s.received))
     UI.lastScanTime=getGameTimer()
     RateTracker.btc=nil; RateTracker.sampleTime=nil
 end
