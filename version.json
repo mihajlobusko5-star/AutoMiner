@@ -1,0 +1,9 @@
+{
+  "version": "1.0.1",
+  "download_url": "https://raw.githubusercontent.com/mihajlobusko5-star/AutoMiner/main/AutoMiner.lua",
+  "changelog": [
+    "Исправлена работа автосбора при открытых диалогах",
+    "Скрыт пустой диалог выбора дома",
+    "Улучшена стабильность автоматизации"
+  ]
+}
