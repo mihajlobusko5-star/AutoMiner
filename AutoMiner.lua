@@ -1,6 +1,6 @@
 script_name("AutoMiner")
 script_author("Moli")
-script_version("1.1.3")
+script_version("1.1.4")
 
 require "lib.moonloader"
 
@@ -1277,7 +1277,7 @@ local function getScriptDir()
 end
 
 
-local Runtime={revision="1.1.3",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
+local Runtime={revision="1.1.4",lastLog={},readySince=nil,sessionKey=nil,initialRetry=0}
 function Runtime.failure(message)
     UI.storageError="Не вдалося зберегти дані: "..tostring(message)
 end
@@ -1627,44 +1627,10 @@ local function updateVersionNewer(remote,localv)
     local ra,rb,rc=updateVersionParts(remote);local la,lb,lc=updateVersionParts(localv)
     if ra~=la then return ra>la end;if rb~=lb then return rb>lb end;return rc>lc
 end
-UpdateManager.downloadCallbacks=UpdateManager.downloadCallbacks or {}
-UpdateManager.downloadSerial=UpdateManager.downloadSerial or 0
-local function updateDownload(url,path,timeout)
-    if not downloadUrlToFile then return false,"downloadUrlToFile unavailable" end
-    pcall(os.remove,path)
-    UpdateManager.downloadSerial=UpdateManager.downloadSerial+1
-    local token=UpdateManager.downloadSerial
-    local state={done=false,success=false,timedOut=false}
-    local callback
-    callback=function(_,status)
-        if status==6 then state.done=true;state.success=true
-        elseif status==7 then state.done=true;state.success=false end
-        if state.done then
-            -- Keep the callback alive until MoonLoader confirms completion/failure.
-            -- Releasing it on our own timeout can leave native downloader code with
-            -- a dangling Lua callback and crash lua51.dll later.
-            UpdateManager.downloadCallbacks[token]=nil
-            if state.timedOut then pcall(os.remove,path) end
-        end
-    end
-    UpdateManager.downloadCallbacks[token]=callback
-    local ok,err=pcall(downloadUrlToFile,url,path,callback)
-    if not ok then UpdateManager.downloadCallbacks[token]=nil;return false,tostring(err or "download start failed") end
-    local started=getGameTimer();timeout=timeout or 60000
-    while not state.done and getGameTimer()-started<timeout do wait(50) end
-    if not state.done then
-        state.timedOut=true
-        -- Do not free the callback here. MoonLoader may still invoke it later.
-        -- The callback removes itself only after a terminal download status.
-        return false,"download timeout"
-    end
-    if not state.success then pcall(os.remove,path);return false,"download failed" end
-    return true
-end
 local UpdateWin32=nil
 local function updateHiddenProcess(command,timeoutMs)
     if not UpdateWin32 then
-        local ok=pcall(ffi.cdef,[[
+        local ok=pcall(ffi.cdef,[=[
             typedef void* AM_HANDLE;
             typedef unsigned long AM_DWORD;
             typedef int AM_BOOL;
@@ -1683,8 +1649,9 @@ local function updateHiddenProcess(command,timeoutMs)
             AM_BOOL CreateProcessA(const char*, char*, void*, void*, AM_BOOL, AM_DWORD, void*, const char*, AM_STARTUPINFOA*, AM_PROCESS_INFORMATION*);
             AM_DWORD WaitForSingleObject(AM_HANDLE, AM_DWORD);
             AM_BOOL TerminateProcess(AM_HANDLE, unsigned int);
+            AM_BOOL GetExitCodeProcess(AM_HANDLE, AM_DWORD*);
             AM_BOOL CloseHandle(AM_HANDLE);
-        ]])
+        ]=])
         local loaded,lib=pcall(ffi.load,"kernel32")
         if not ok or not loaded then return false,"win32 unavailable" end
         UpdateWin32=lib
@@ -1692,17 +1659,43 @@ local function updateHiddenProcess(command,timeoutMs)
     local si=ffi.new("AM_STARTUPINFOA[1]")
     local pi=ffi.new("AM_PROCESS_INFORMATION[1]")
     si[0].cb=ffi.sizeof("AM_STARTUPINFOA")
-    si[0].dwFlags=0x00000001 -- STARTF_USESHOWWINDOW
-    si[0].wShowWindow=0      -- SW_HIDE
+    si[0].dwFlags=0x00000001
+    si[0].wShowWindow=0
     local buffer=ffi.new("char[?]",#command+2)
     ffi.copy(buffer,command)
-    local ok=UpdateWin32.CreateProcessA(nil,buffer,nil,nil,0,0x08000000,nil,nil,si,pi) -- CREATE_NO_WINDOW
-    if ok==0 then return false,"CreateProcess failed" end
-    local waitResult=UpdateWin32.WaitForSingleObject(pi[0].hProcess,tonumber(timeoutMs) or 15000)
-    if waitResult==0x00000102 then UpdateWin32.TerminateProcess(pi[0].hProcess,1) end
+    local created=UpdateWin32.CreateProcessA(nil,buffer,nil,nil,0,0x08000000,nil,nil,si,pi)
+    if created==0 then return false,"CreateProcess failed" end
+    local started=getGameTimer();local timeout=tonumber(timeoutMs) or 30000
+    local result=0x00000102
+    while getGameTimer()-started<timeout do
+        result=UpdateWin32.WaitForSingleObject(pi[0].hProcess,0)
+        if result==0 then break end
+        if result~=0x00000102 then break end
+        wait(50)
+    end
+    if result==0x00000102 then
+        UpdateWin32.TerminateProcess(pi[0].hProcess,1)
+        UpdateWin32.WaitForSingleObject(pi[0].hProcess,2000)
+    end
+    local exitCode=ffi.new("AM_DWORD[1]",1)
+    UpdateWin32.GetExitCodeProcess(pi[0].hProcess,exitCode)
     UpdateWin32.CloseHandle(pi[0].hThread);UpdateWin32.CloseHandle(pi[0].hProcess)
-    return waitResult==0
+    if result~=0 then return false,result==0x00000102 and "process timeout" or "process wait failed" end
+    return tonumber(exitCode[0])==0,tonumber(exitCode[0])==0 and nil or ("process exit "..tostring(tonumber(exitCode[0])))
 end
+
+local function updateDownload(url,path,timeout)
+    pcall(os.remove,path)
+    local ps="$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri '"..updateQps(url).."' -OutFile '"..updateQps(path).."'"
+    local cmd='powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "'..ps..'"'
+    Runtime.log("UPDATE_DOWNLOAD_START","backend=hidden_process",2)
+    local ok,why=updateHiddenProcess(cmd,timeout or 60000)
+    if not ok then pcall(os.remove,path);return false,tostring(why or "download failed") end
+    local body=updateReadAll(path)
+    if not body or #body==0 then pcall(os.remove,path);return false,"download empty" end
+    return true
+end
+
 local function updateSha256(path)
     local outPath=cacheFilePath("update-sha256.tmp")
     pcall(os.remove,outPath)
@@ -2796,42 +2789,30 @@ function BitcoinHistory.accept(body)
     return true
 end
 local function fetchBitcoinHistory()
-    if BitcoinHistory.busy or not downloadUrlToFile then return end
+    if BitcoinHistory.busy then return end
     BitcoinHistory.busy=true;BitcoinHistory.token=BitcoinHistory.token+1
     local token=BitcoinHistory.token
     local temp=cacheFilePath("bitcoin-history.download.tmp");pcall(os.remove,temp)
-    local finishTime=os.time()
-    local startTime=finishTime-30*86400
+    local finishTime=os.time();local startTime=finishTime-30*86400
     local startIso=os.date("!%Y-%m-%dT%H:%M:%SZ",startTime)
     local endIso=os.date("!%Y-%m-%dT%H:%M:%SZ",finishTime)
     local url="https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=21600&start="..startIso.."&end="..endIso
-    local function finish(success)
-        pcall(os.remove,temp)
-        if token~=BitcoinHistory.token then return end
-        BitcoinHistory.busy=false;BitcoinHistory.nextAttempt=getGameTimer()+(success and 3600000 or 60000)
-        if not success then BitcoinHistory.cached=#BitcoinHistory.points>0 end
-    end
-    local ok=pcall(downloadUrlToFile,url,temp,function(id,status)
-        if status==6 then
-            if token~=BitcoinHistory.token then os.remove(temp);return end
-            local f=Runtime.open(temp,"rb")
-            local body=f and f:read("*a") or ""
-            if f then f:close() end
-            local accepted=BitcoinHistory.accept(body)
-            os.remove(temp);finish(accepted)
-        end
-    end)
-    if not ok then finish(false);return end
     lua_thread.create(function()
-        wait(30000)
-        if token==BitcoinHistory.token and BitcoinHistory.busy then
-            finish(false);BitcoinHistory.token=BitcoinHistory.token+1;os.remove(temp)
+        local ok=updateDownload(url,temp,30000)
+        if token~=BitcoinHistory.token then pcall(os.remove,temp);return end
+        local accepted=false
+        if ok then
+            local f=Runtime.open(temp,"rb");local body=f and f:read("*a") or "";if f then f:close() end
+            accepted=BitcoinHistory.accept(body)
         end
+        pcall(os.remove,temp)
+        BitcoinHistory.busy=false;BitcoinHistory.nextAttempt=getGameTimer()+(accepted and 3600000 or 60000)
+        if not accepted then BitcoinHistory.cached=#BitcoinHistory.points>0 end
     end)
 end
 
 local function fetchBitcoinHourly()
-    if BitcoinHourly.busy or not downloadUrlToFile then return end
+    if BitcoinHourly.busy then return end
     BitcoinHourly.busy=true;BitcoinHourly.token=BitcoinHourly.token+1
     local token=BitcoinHourly.token
     local temp=cacheFilePath("bitcoin-hourly.download.tmp");pcall(os.remove,temp)
@@ -2839,23 +2820,17 @@ local function fetchBitcoinHourly()
     local startIso=os.date("!%Y-%m-%dT%H:%M:%SZ",startTime)
     local endIso=os.date("!%Y-%m-%dT%H:%M:%SZ",finishTime)
     local url="https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=3600&start="..startIso.."&end="..endIso
-    local function finish(success)
-        pcall(os.remove,temp)
-        if token~=BitcoinHourly.token then return end
-        BitcoinHourly.busy=false;BitcoinHourly.nextAttempt=getGameTimer()+(success and 3600000 or 60000)
-        if not success then BitcoinHourly.cached=#BitcoinHourly.points>0 end
-    end
-    local ok=pcall(downloadUrlToFile,url,temp,function(id,status)
-        if status==6 then
-            if token~=BitcoinHourly.token then os.remove(temp);return end
-            local f=Runtime.open(temp,"rb");local body=f and f:read("*a") or "";if f then f:close() end
-            local accepted=BitcoinHourly.accept(body);os.remove(temp);finish(accepted)
-        end
-    end)
-    if not ok then finish(false);return end
     lua_thread.create(function()
-        wait(30000)
-        if token==BitcoinHourly.token and BitcoinHourly.busy then finish(false);BitcoinHourly.token=BitcoinHourly.token+1;os.remove(temp) end
+        local ok=updateDownload(url,temp,30000)
+        if token~=BitcoinHourly.token then pcall(os.remove,temp);return end
+        local accepted=false
+        if ok then
+            local f=Runtime.open(temp,"rb");local body=f and f:read("*a") or "";if f then f:close() end
+            accepted=BitcoinHourly.accept(body)
+        end
+        pcall(os.remove,temp)
+        BitcoinHourly.busy=false;BitcoinHourly.nextAttempt=getGameTimer()+(accepted and 3600000 or 60000)
+        if not accepted then BitcoinHourly.cached=#BitcoinHourly.points>0 end
     end)
 end
 
@@ -2891,30 +2866,17 @@ local function fetchBitcoinPrice()
     BitcoinPrice.token=BitcoinPrice.token+1
     local token=BitcoinPrice.token
     local temp=cacheFilePath("bitcoin-price.download.tmp");pcall(os.remove,temp)
-    local function finish(success)
-        pcall(os.remove,temp)
-        if token~=BitcoinPrice.token then return end
-        BitcoinPrice.busy=false
-        if not success then BitcoinPrice.cached=true;BitcoinPrice.nextAttempt=getGameTimer()+60000 end
-    end
-    if not downloadUrlToFile then finish(false);return end
-    local ok=pcall(downloadUrlToFile,"https://api.coinbase.com/v2/prices/BTC-USD/spot",temp,
-        function(id,status)
-            if status==6 then
-                if token~=BitcoinPrice.token then os.remove(temp);return end
-                local f=Runtime.open(temp,"rb")
-                local body=f and f:read(16384) or ""
-                if f then f:close() end
-                local accepted=BitcoinPrice.accept(body)
-                os.remove(temp);finish(accepted)
-            end
-        end)
-    if not ok then finish(false);return end
     lua_thread.create(function()
-        wait(30000)
-        if token==BitcoinPrice.token and BitcoinPrice.busy then
-            finish(false);BitcoinPrice.token=BitcoinPrice.token+1;os.remove(temp)
+        local ok=updateDownload("https://api.coinbase.com/v2/prices/BTC-USD/spot",temp,30000)
+        if token~=BitcoinPrice.token then pcall(os.remove,temp);return end
+        local accepted=false
+        if ok then
+            local f=Runtime.open(temp,"rb");local body=f and f:read(16384) or "";if f then f:close() end
+            accepted=BitcoinPrice.accept(body)
         end
+        pcall(os.remove,temp)
+        BitcoinPrice.busy=false
+        if not accepted then BitcoinPrice.cached=true;BitcoinPrice.nextAttempt=getGameTimer()+60000 end
     end)
 end
 
@@ -12151,7 +12113,12 @@ function main()
         UIResources.prewarmRequestedAt=getGameTimer()
         Runtime.log("PERF_PREWARM_REQUEST","runtime_ready_1800ms")
     end)
-    lua_thread.create(function() wait(8000);if not UI.open[0] and not UI.closing then UpdateManager.check(false) else wait(5000);UpdateManager.check(false) end end)
+    lua_thread.create(function()
+        wait(12000)
+        local deadline=getGameTimer()+30000
+        while getGameTimer()<deadline and (UI.scanning or UI.collecting or UI.balanceUpdating or UI.waiting or UI.loading or (DialogGate and DialogGate.owner~="none")) do wait(500) end
+        UpdateManager.check(false)
+    end)
     Journal.add("system","AutoMiner запущено","Нова сесія · /miner")
     local function toggleMiner()
         if UI.open[0] or UI.closing then View.requestMainClose(); return end
